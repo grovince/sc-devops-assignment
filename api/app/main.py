@@ -39,7 +39,8 @@ app = FastAPI(
     summary="게임 로그 수집",
 )
 async def ingest_log(event: LogEvent):
-    # mode="json" -> datetime을 ISO 8601 문자열로 직렬화
+    # mode="json" -> datetime을 ISO 8601 문자열로 직렬화.
+    # event_id는 이 시점(Kafka 전송 전)에 이미 확정되어 있다.
     record = event.model_dump(mode="json")
     # 클라이언트 시각(timestamp)과 구분되는 서버 수신 시각.
     # 클라이언트 시계는 신뢰할 수 없으므로 파이프라인 지연 측정의 기준으로 쓴다.
@@ -51,6 +52,7 @@ async def ingest_log(event: LogEvent):
         # 큐 전송에 실패했는데 200을 주면 클라이언트는 성공으로 오인하고
         # 재시도하지 않는다. 그 순간 로그는 확정적으로 유실된다.
         # 따라서 503을 반환해 재시도 책임을 클라이언트로 되돌린다.
+        # (재시도 시 클라이언트가 동일 event_id를 보내면 중복까지 방지된다)
         logger.error("failed to publish log: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -58,6 +60,7 @@ async def ingest_log(event: LogEvent):
         ) from exc
 
     return IngestResponse(
+        event_id=event.event_id,
         topic=meta.topic,
         partition=meta.partition,
         offset=meta.offset,
