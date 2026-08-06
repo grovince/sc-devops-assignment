@@ -1,5 +1,7 @@
-venv/
-.venv/
+# 빌드 컨텍스트에서 제외 -> 이미지 오염 방지 + 캐시 무효화 최소화
 __pycache__/
 *.pyc
+.venv/
+venv/
+.git/
 .env
