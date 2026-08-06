@@ -1,4 +1,4 @@
-# 게임 로그 수집 파이프라인
+# 로그 수집 파이프라인
 
 ```
 curl → nginx(:8000) → api (FastAPI, N replicas) → Kafka (KRaft)
