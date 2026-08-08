@@ -1,233 +1,212 @@
-# ---------------------------------------------------------------------------
-# 보안 그룹 체인
-#
-# 모든 규칙은 CIDR이 아닌 보안 그룹 ID 참조로 구성한다.
-# Fargate 태스크는 IP가 동적으로 변경되므로 대역 기반 규칙은 관리가 어렵고,
-# 동일 서브넷 내 무관한 리소스까지 허용하는 과도한 권한이 된다.
-#
-# 규칙은 인라인 블록 대신 별도 리소스로 분리한다.
-# SG끼리 상호 참조할 때 인라인 블록은 순환 의존을 유발한다.
-#
-#   0.0.0.0/0 --443--> ALB SG
-#                        | 8000
-#                        v
-#                      API SG --9098--> MSK SG <--9098-- Consumer SG
-#                        |                                   |
-#                        +--443--> VPCE SG <--443------------+
-#                                                            |
-#                                          443 (S3 prefix list)
-#                                                            v
-#                                                 S3 Gateway Endpoint
-# ---------------------------------------------------------------------------
-
-# Gateway Endpoint에는 보안 그룹이 존재하지 않아 아웃바운드 제어가 불가능하다.
-# egress를 0.0.0.0/0 대신 S3 대역으로 한정하기 위해 관리형 prefix list를 참조한다.
-data "aws_prefix_list" "s3" {
-  name = "com.amazonaws.${var.region}.s3"
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
 }
 
-# ------------------------------- ALB -------------------------------
+# ===========================================================================
+# 보안 그룹
+#
+# 최소 권한 원칙에 따라, 모든 규칙은 CIDR이 아니라 상대 보안 그룹을 참조한다.
+# 예외는 두 가지다.
+#   - ALB의 퍼블릭 인그레스 (외부 클라이언트라 참조할 SG가 없음)
+#   - S3로의 이그레스 (Gateway Endpoint라 ENI가 없어 prefix list를 사용)
+#
+# 트래픽 체인:
+#   인터넷 -> ALB :80/:443 -> ECS 태스크 :container_port -> 엔드포인트 :443
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# ALB 보안 그룹
+# ---------------------------------------------------------------------------
+
 resource "aws_security_group" "alb" {
-  name        = "${var.name}-alb-sg"
-  description = "ALB. 인터넷에 노출되는 유일한 지점"
+  name        = "${var.name_prefix}-alb-sg"
+  description = "퍼블릭 ALB로 들어오는 인터넷 트래픽"
   vpc_id      = var.vpc_id
 
-  tags = { Name = "${var.name}-alb-sg" }
+  tags = {
+    Name = "${var.name_prefix}-alb-sg"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "alb_https" {
-  security_group_id = aws_security_group.alb.id
-  description       = "인터넷에서 HTTPS 수신"
-  cidr_ipv4         = "0.0.0.0/0"
-  from_port         = 443
-  to_port           = 443
-  ip_protocol       = "tcp"
-}
+resource "aws_vpc_security_group_ingress_rule" "alb_http" {
+  count = length(var.alb_ingress_cidrs)
 
-resource "aws_vpc_security_group_ingress_rule" "alb_http_redirect" {
   security_group_id = aws_security_group.alb.id
-  description       = "HTTPS 리다이렉트 전용"
-  cidr_ipv4         = "0.0.0.0/0"
+  description       = "허용된 클라이언트로부터의 HTTP"
+  cidr_ipv4         = var.alb_ingress_cidrs[count.index]
   from_port         = 80
   to_port           = 80
   ip_protocol       = "tcp"
 }
 
-resource "aws_vpc_security_group_egress_rule" "alb_to_api" {
+resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+  count = length(var.alb_ingress_cidrs)
+
+  security_group_id = aws_security_group.alb.id
+  description       = "허용된 클라이언트로부터의 HTTPS"
+  cidr_ipv4         = var.alb_ingress_cidrs[count.index]
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
   security_group_id            = aws_security_group.alb.id
-  description                  = "API 태스크로 전달"
-  referenced_security_group_id = aws_security_group.api.id
-  from_port                    = var.api_container_port
-  to_port                      = var.api_container_port
+  description                  = "ECS 태스크의 컨테이너 포트로 전달"
+  referenced_security_group_id = aws_security_group.ecs_tasks.id
+  from_port                    = var.container_port
+  to_port                      = var.container_port
   ip_protocol                  = "tcp"
 }
 
-# ------------------------------- API 태스크 -------------------------------
-resource "aws_security_group" "api" {
-  name        = "${var.name}-api-sg"
-  description = "Fargate API 태스크"
+# ---------------------------------------------------------------------------
+# ECS 태스크 보안 그룹
+#
+# 프라이빗 서브넷에 NAT Gateway가 없으므로, 아래 두 이그레스 규칙이
+# 태스크가 가진 외부 통신 경로의 전부다.
+# ---------------------------------------------------------------------------
+
+resource "aws_security_group" "ecs_tasks" {
+  name        = "${var.name_prefix}-ecs-tasks-sg"
+  description = "프라이빗 서브넷에서 실행되는 Fargate 기반 로그 API 태스크"
   vpc_id      = var.vpc_id
 
-  tags = { Name = "${var.name}-api-sg" }
+  tags = {
+    Name = "${var.name_prefix}-ecs-tasks-sg"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "api_from_alb" {
-  security_group_id            = aws_security_group.api.id
-  description                  = "ALB에서만 수신. 인터넷 및 동일 서브넷 타 리소스 접근 불가"
+resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
+  security_group_id            = aws_security_group.ecs_tasks.id
+  description                  = "ALB로부터의 컨테이너 포트 접근"
   referenced_security_group_id = aws_security_group.alb.id
-  from_port                    = var.api_container_port
-  to_port                      = var.api_container_port
+  from_port                    = var.container_port
+  to_port                      = var.container_port
   ip_protocol                  = "tcp"
 }
 
-resource "aws_vpc_security_group_egress_rule" "api_to_msk" {
-  security_group_id            = aws_security_group.api.id
-  description                  = "MSK produce"
-  referenced_security_group_id = aws_security_group.msk.id
-  from_port                    = var.msk_port
-  to_port                      = var.msk_port
-  ip_protocol                  = "tcp"
-}
-
-resource "aws_vpc_security_group_egress_rule" "api_to_vpce" {
-  security_group_id            = aws_security_group.api.id
-  description                  = "ECR 이미지 풀, CloudWatch Logs 전송"
-  referenced_security_group_id = aws_security_group.vpce.id
+resource "aws_vpc_security_group_egress_rule" "tasks_to_endpoints" {
+  security_group_id            = aws_security_group.ecs_tasks.id
+  description                  = "VPC Interface Endpoint(Kinesis, ECR, Logs)로의 HTTPS"
+  referenced_security_group_id = var.vpc_endpoints_sg_id
   from_port                    = 443
   to_port                      = 443
   ip_protocol                  = "tcp"
 }
 
-resource "aws_vpc_security_group_egress_rule" "api_to_s3" {
-  security_group_id = aws_security_group.api.id
-  description       = "ECR 이미지 레이어는 S3에 저장되므로 필요"
-  prefix_list_id    = data.aws_prefix_list.s3.id
+# S3 Gateway Endpoint는 ENI가 아니라 라우트 테이블 항목으로 동작하므로
+# 보안 그룹 참조 대신 관리형 prefix list를 사용해야 한다.
+resource "aws_vpc_security_group_egress_rule" "tasks_to_s3" {
+  security_group_id = aws_security_group.ecs_tasks.id
+  description       = "Gateway Endpoint를 통한 S3 HTTPS 접근 (ECR 이미지 레이어)"
+  prefix_list_id    = var.s3_prefix_list_id
   from_port         = 443
   to_port           = 443
   ip_protocol       = "tcp"
 }
 
-# ------------------------------- 컨슈머 태스크 -------------------------------
-resource "aws_security_group" "consumer" {
-  name        = "${var.name}-consumer-sg"
-  description = "Fargate 컨슈머 태스크. 인바운드 규칙 없음"
-  vpc_id      = var.vpc_id
+# ---------------------------------------------------------------------------
+# VPC 엔드포인트 인그레스
+#
+# 보안 그룹 자체는 network 모듈이 만든다. 엔드포인트가 생성 시점에 그 ID를
+# 필요로 하기 때문이다. 여기서는 규칙만 붙여, 위에서 정의한 태스크 보안
+# 그룹을 직접 참조할 수 있게 한다.
+# ---------------------------------------------------------------------------
 
-  tags = { Name = "${var.name}-consumer-sg" }
-}
-
-# 인바운드 규칙을 의도적으로 정의하지 않는다.
-# Kafka 컨슈머는 브로커로 폴링하는 방식이므로 외부에서 접근할 필요가 없다.
-
-resource "aws_vpc_security_group_egress_rule" "consumer_to_msk" {
-  security_group_id            = aws_security_group.consumer.id
-  description                  = "MSK consume"
-  referenced_security_group_id = aws_security_group.msk.id
-  from_port                    = var.msk_port
-  to_port                      = var.msk_port
-  ip_protocol                  = "tcp"
-}
-
-resource "aws_vpc_security_group_egress_rule" "consumer_to_msk_prometheus" {
-  security_group_id            = aws_security_group.consumer.id
-  description                  = "consumer lag 지표 수집"
-  referenced_security_group_id = aws_security_group.msk.id
-  from_port                    = 11001
-  to_port                      = 11002
-  ip_protocol                  = "tcp"
-}
-
-resource "aws_vpc_security_group_egress_rule" "consumer_to_vpce" {
-  security_group_id            = aws_security_group.consumer.id
-  description                  = "ECR 이미지 풀, CloudWatch Logs 전송"
-  referenced_security_group_id = aws_security_group.vpce.id
+resource "aws_vpc_security_group_ingress_rule" "endpoints_from_tasks" {
+  security_group_id            = var.vpc_endpoints_sg_id
+  description                  = "ECS 태스크로부터의 HTTPS"
+  referenced_security_group_id = aws_security_group.ecs_tasks.id
   from_port                    = 443
   to_port                      = 443
   ip_protocol                  = "tcp"
 }
 
-resource "aws_vpc_security_group_egress_rule" "consumer_to_s3" {
-  security_group_id = aws_security_group.consumer.id
-  description       = "S3 적재. Gateway Endpoint는 SG가 없어 prefix list로 대상 한정"
-  prefix_list_id    = data.aws_prefix_list.s3.id
-  from_port         = 443
-  to_port           = 443
-  ip_protocol       = "tcp"
-}
+# ===========================================================================
+# WAFv2
+#
+# ALB에 연결하므로 scope는 REGIONAL이다.
+# WAF는 트래픽이 통과하는 네트워크 홉이 아니라 로드 밸런서에 부착되는
+# 정책이다. 실제 연결(association)은 아래 ARN을 받아가는 alb 모듈이 수행한다.
+# ===========================================================================
 
-# ------------------------------- MSK -------------------------------
-resource "aws_security_group" "msk" {
-  name        = "${var.name}-msk-sg"
-  description = "MSK 브로커"
-  vpc_id      = var.vpc_id
+resource "aws_wafv2_web_acl" "this" {
+  name        = "${var.name_prefix}-waf"
+  description = "로그 수집 ALB에 적용할 요청 제한 및 관리형 규칙"
+  scope       = "REGIONAL"
 
-  tags = { Name = "${var.name}-msk-sg" }
-}
+  default_action {
+    allow {}
+  }
 
-resource "aws_vpc_security_group_ingress_rule" "msk_from_api" {
-  security_group_id            = aws_security_group.msk.id
-  description                  = "API 태스크의 produce"
-  referenced_security_group_id = aws_security_group.api.id
-  from_port                    = var.msk_port
-  to_port                      = var.msk_port
-  ip_protocol                  = "tcp"
-}
+  # 5분 롤링 윈도우 안에서 제한을 초과한 출발지 IP를 차단한다.
+  rule {
+    name     = "rate-limit-per-ip"
+    priority = 1
 
-resource "aws_vpc_security_group_ingress_rule" "msk_from_consumer" {
-  security_group_id            = aws_security_group.msk.id
-  description                  = "컨슈머 태스크의 consume"
-  referenced_security_group_id = aws_security_group.consumer.id
-  from_port                    = var.msk_port
-  to_port                      = var.msk_port
-  ip_protocol                  = "tcp"
-}
+    action {
+      block {}
+    }
 
-resource "aws_vpc_security_group_ingress_rule" "msk_prometheus" {
-  security_group_id            = aws_security_group.msk.id
-  description                  = "Prometheus 오픈 모니터링. consumer lag 오토스케일링에 사용"
-  referenced_security_group_id = aws_security_group.consumer.id
-  from_port                    = 11001
-  to_port                      = 11002
-  ip_protocol                  = "tcp"
-}
+    statement {
+      rate_based_statement {
+        limit              = var.rate_limit
+        aggregate_key_type = "IP"
+      }
+    }
 
-resource "aws_vpc_security_group_ingress_rule" "msk_internal" {
-  security_group_id            = aws_security_group.msk.id
-  description                  = "브로커 간 replication"
-  referenced_security_group_id = aws_security_group.msk.id
-  from_port                    = 9090
-  to_port                      = 9098
-  ip_protocol                  = "tcp"
-}
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.name_prefix}-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
 
-resource "aws_vpc_security_group_egress_rule" "msk_internal_out" {
-  security_group_id            = aws_security_group.msk.id
-  description                  = "브로커 간 replication"
-  referenced_security_group_id = aws_security_group.msk.id
-  ip_protocol                  = "-1"
-}
+  # 기본 보호 규칙 세트. 실제 트래픽으로 튜닝하기 전까지는 count 모드로 둔다.
+  # 오탐이 게임 로그를 조용히 버리는 상황을 막기 위함이다.
+  rule {
+    name     = "aws-common-rules"
+    priority = 2
 
-# ------------------------- Interface Endpoint ENI -------------------------
-resource "aws_security_group" "vpce" {
-  name        = "${var.name}-vpce-sg"
-  description = "Interface Endpoint ENI. 누락 시 ECR 풀이 조용히 실패한다"
-  vpc_id      = var.vpc_id
+    override_action {
+      count {}
+    }
 
-  tags = { Name = "${var.name}-vpce-sg" }
-}
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+      }
+    }
 
-resource "aws_vpc_security_group_ingress_rule" "vpce_from_api" {
-  security_group_id            = aws_security_group.vpce.id
-  referenced_security_group_id = aws_security_group.api.id
-  from_port                    = 443
-  to_port                      = 443
-  ip_protocol                  = "tcp"
-}
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.name_prefix}-common-rules"
+      sampled_requests_enabled   = true
+    }
+  }
 
-resource "aws_vpc_security_group_ingress_rule" "vpce_from_consumer" {
-  security_group_id            = aws_security_group.vpce.id
-  referenced_security_group_id = aws_security_group.consumer.id
-  from_port                    = 443
-  to_port                      = 443
-  ip_protocol                  = "tcp"
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.name_prefix}-waf"
+    sampled_requests_enabled   = true
+  }
+
+  tags = {
+    Name = "${var.name_prefix}-waf"
+  }
 }

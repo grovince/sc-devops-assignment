@@ -1,89 +1,165 @@
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 클러스터 및 컨테이너 로그 그룹
+# ---------------------------------------------------------------------------
+
 resource "aws_ecs_cluster" "this" {
-  name = "${var.name}-cluster"
+  name = "${var.name_prefix}-cluster"
 
   setting {
     name  = "containerInsights"
     value = "enabled"
   }
 
-  tags = { Name = "${var.name}-ecs" }
+  tags = {
+    Name = "${var.name_prefix}-cluster"
+  }
 }
 
 resource "aws_ecs_cluster_capacity_providers" "this" {
   cluster_name       = aws_ecs_cluster.this.name
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+  capacity_providers = ["FARGATE"]
 
-  # 컨슈머는 중단되어도 커밋된 오프셋부터 재개되므로 Spot 활용 여지가 있으나,
-  # API는 중단이 요청 유실로 직결되므로 온디맨드만 사용한다.
   default_capacity_provider_strategy {
     capacity_provider = "FARGATE"
     weight            = 1
-    base              = 0
   }
 }
 
+# 컨테이너의 stdout / stderr를 받는다.
+# 이것은 애플리케이션 운영 로그이며, S3로 적재되는 게임 로그와는
+# 목적지도 성격도 의도적으로 분리했다.
 resource "aws_cloudwatch_log_group" "api" {
-  name              = "/ecs/${var.name}/api"
+  name              = "/ecs/${var.name_prefix}-api"
   retention_in_days = var.log_retention_days
-}
 
-resource "aws_cloudwatch_log_group" "consumer" {
-  name              = "/ecs/${var.name}/consumer"
-  retention_in_days = var.log_retention_days
+  tags = {
+    Name = "${var.name_prefix}-api-logs"
+  }
 }
 
 # ---------------------------------------------------------------------------
-# API 태스크
+# 태스크 실행 역할 (Task Execution Role)
+#
+# 애플리케이션 코드가 아니라 ECS 에이전트가 사용하는 역할이다.
+# 이미지를 pull하고 로그 스트림을 생성하는 데 쓰인다.
 # ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ecs_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "execution" {
+  name               = "${var.name_prefix}-task-execution-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "execution_managed" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# ---------------------------------------------------------------------------
+# 태스크 역할 (Task Role)
+#
+# 애플리케이션 컨테이너가 직접 사용하는 역할이다.
+# 권한은 지정된 Kinesis 스트림에 레코드를 쓰는 것으로만 한정한다.
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_role" "task" {
+  name               = "${var.name_prefix}-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+data "aws_iam_policy_document" "task" {
+  statement {
+    sid    = "PutLogRecords"
+    effect = "Allow"
+    actions = [
+      "kinesis:PutRecord",
+      "kinesis:PutRecords",
+      "kinesis:DescribeStreamSummary",
+    ]
+    resources = [var.kinesis_stream_arn]
+  }
+
+  # 스트림이 KMS로 암호화되어 있어 쓰기 시 데이터 키 생성 권한이 필요하다.
+  # kms:ViaService 조건으로 Kinesis 경유 호출로만 범위를 좁힌다.
+  statement {
+    sid    = "EncryptStreamRecords"
+    effect = "Allow"
+    actions = [
+      "kms:GenerateDataKey",
+    ]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["kinesis.${var.region}.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "task" {
+  name   = "${var.name_prefix}-task-policy"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task.json
+}
+
+# ---------------------------------------------------------------------------
+# 태스크 정의
+# ---------------------------------------------------------------------------
+
 resource "aws_ecs_task_definition" "api" {
-  family                   = "${var.name}-api"
+  family                   = "${var.name_prefix}-api"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 1024
-  memory                   = 2048
+  cpu                      = var.task_cpu
+  memory                   = var.task_memory
 
   execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.api_task.arn
+  task_role_arn      = aws_iam_role.task.arn
 
   runtime_platform {
     operating_system_family = "LINUX"
-    cpu_architecture        = var.cpu_architecture
+    cpu_architecture        = "X86_64"
   }
 
   container_definitions = jsonencode([
     {
       name      = "api"
-      image     = var.api_image
+      image     = var.container_image
       essential = true
 
       portMappings = [
         {
-          containerPort = var.api_container_port
+          containerPort = var.container_port
           protocol      = "tcp"
         }
       ]
 
       environment = [
-        { name = "KAFKA_BOOTSTRAP_SERVERS", value = var.bootstrap_brokers },
-        { name = "KAFKA_TOPIC", value = var.kafka_topic },
-        { name = "KAFKA_SECURITY_PROTOCOL", value = "SASL_SSL" },
-        { name = "KAFKA_SASL_MECHANISM", value = "AWS_MSK_IAM" },
-
-        # 무손실 프로듀서 설정.
-        # 브로커의 min.insync.replicas=2와 짝을 이루어야 의미가 있다.
-        { name = "KAFKA_ACKS", value = "all" },
-        { name = "KAFKA_ENABLE_IDEMPOTENCE", value = "true" },
-
-        # 처리량 최적화. 로그 수집은 수십 ms 지연이 문제되지 않으므로
-        # 배치를 모아 압축 효율과 throughput을 높인다.
-        { name = "KAFKA_LINGER_MS", value = "20" },
-        { name = "KAFKA_BATCH_SIZE", value = "65536" },
-        { name = "KAFKA_COMPRESSION_TYPE", value = "lz4" },
-
-        # 브로커 지연 시 버퍼에 축적하고, 초과하면 5초 후 예외를 던진다.
-        # 무한 대기로 헬스체크가 실패해 태스크가 죽는 것보다 낫다.
-        { name = "KAFKA_BUFFER_MEMORY", value = "134217728" },
-        { name = "KAFKA_MAX_BLOCK_MS", value = "5000" },
+        { name = "KINESIS_STREAM_NAME", value = var.kinesis_stream_name },
+        { name = "AWS_REGION", value = var.region },
+        { name = "PORT", value = tostring(var.container_port) },
       ]
 
       logConfiguration = {
@@ -94,147 +170,101 @@ resource "aws_ecs_task_definition" "api" {
           "awslogs-stream-prefix" = "api"
         }
       }
-
-      healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:${var.api_container_port}/health || exit 1"]
-        interval    = 15
-        timeout     = 5
-        retries     = 3
-        startPeriod = 30
-      }
     }
   ])
 
-  tags = { Name = "${var.name}-api-task" }
+  tags = {
+    Name = "${var.name_prefix}-api-task"
+  }
 }
 
+# ---------------------------------------------------------------------------
+# 서비스
+# ---------------------------------------------------------------------------
+
 resource "aws_ecs_service" "api" {
-  name            = "${var.name}-api"
+  name            = "${var.name_prefix}-api-svc"
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.api.arn
-  desired_count   = var.api_min_capacity
+  desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
-  enable_execute_command = true
-
   network_configuration {
-    subnets          = var.app_subnet_ids
-    security_groups  = [var.api_security_group_id]
+    # 가용 영역별 프라이빗 서브넷에 태스크를 분산 배치한다.
+    subnets = var.private_subnet_ids
+
+    security_groups = [var.ecs_tasks_sg_id]
+
+    # NAT Gateway가 없는 프라이빗 서브넷이므로 퍼블릭 IP를 부여하지 않는다.
+    # 외부 통신은 VPC 엔드포인트를 통해서만 이루어진다.
     assign_public_ip = false
   }
 
   load_balancer {
     target_group_arn = var.target_group_arn
     container_name   = "api"
-    container_port   = var.api_container_port
+    container_port   = var.container_port
   }
 
-  deployment_circuit_breaker {
-    enable   = true
-    rollback = true
-  }
-
-  # 배포 중에도 기존 용량을 유지하여 처리 능력이 떨어지지 않게 한다
+  # 배포 중에도 현재 태스크 수 아래로 내려가지 않는 롤링 배포.
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
 
-  health_check_grace_period_seconds = 60
-
-  lifecycle {
-    # 오토스케일링이 조정한 태스크 수를 terraform이 되돌리지 않도록 제외
-    ignore_changes = [desired_count]
-  }
-
-  # https_listener_arn을 태그로 참조하여 리스너 생성 완료 후 서비스가 만들어지도록 한다.
-  # depends_on에는 변수를 직접 넣을 수 없으므로 암묵적 의존성을 활용한다.
-  tags = {
-    Name        = "${var.name}-api-svc"
-    ListenerRef = var.https_listener_arn
-  }
-}
-
-# ---------------------------------------------------------------------------
-# 컨슈머 태스크
-# ---------------------------------------------------------------------------
-resource "aws_ecs_task_definition" "consumer" {
-  family                   = "${var.name}-consumer"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = 1024
-  memory                   = 4096 # 배치 버퍼링을 위해 API보다 넉넉하게
-
-  execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.consumer_task.arn
-
-  runtime_platform {
-    operating_system_family = "LINUX"
-    cpu_architecture        = var.cpu_architecture
-  }
-
-  container_definitions = jsonencode([
-    {
-      name      = "consumer"
-      image     = var.consumer_image
-      essential = true
-
-      environment = [
-        { name = "KAFKA_BOOTSTRAP_SERVERS", value = var.bootstrap_brokers },
-        { name = "KAFKA_TOPIC", value = var.kafka_topic },
-        { name = "KAFKA_GROUP_ID", value = var.consumer_group_id },
-        { name = "KAFKA_SECURITY_PROTOCOL", value = "SASL_SSL" },
-        { name = "KAFKA_SASL_MECHANISM", value = "AWS_MSK_IAM" },
-
-        # auto commit을 비활성화하고 S3 적재 성공 후 수동 커밋한다.
-        # 순서가 반대면 커밋 후 적재 실패 시 해당 배치가 유실된다.
-        # at-least-once가 되므로 중복은 오프셋 기반 오브젝트 키로 멱등 처리한다.
-        { name = "KAFKA_ENABLE_AUTO_COMMIT", value = "false" },
-        { name = "KAFKA_MAX_POLL_RECORDS", value = "1000" },
-
-        { name = "S3_BUCKET", value = var.s3_bucket_id },
-        { name = "S3_PREFIX", value = var.s3_raw_prefix },
-        { name = "S3_FORMAT", value = "parquet" },
-        { name = "S3_COMPRESSION", value = "snappy" },
-
-        { name = "METRIC_NAMESPACE", value = var.metric_namespace },
-      ]
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.consumer.name
-          "awslogs-region"        = var.region
-          "awslogs-stream-prefix" = "consumer"
-        }
-      }
-    }
-  ])
-
-  tags = { Name = "${var.name}-consumer-task" }
-}
-
-resource "aws_ecs_service" "consumer" {
-  name            = "${var.name}-consumer"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.consumer.arn
-  desired_count   = var.consumer_min_capacity
-  launch_type     = "FARGATE"
-
-  enable_execute_command = true
-
-  network_configuration {
-    subnets          = var.app_subnet_ids
-    security_groups  = [var.consumer_security_group_id]
-    assign_public_ip = false
-  }
-
+  # 배포가 실패하면 자동으로 이전 리비전으로 되돌린다.
   deployment_circuit_breaker {
     enable   = true
     rollback = true
   }
 
+  # 태스크가 등록되고 헬스체크를 통과할 시간을 준다.
+  health_check_grace_period_seconds = 60
+
+  propagate_tags = "SERVICE"
+
+  tags = {
+    Name = "${var.name_prefix}-api-svc"
+  }
+
+  # 오토스케일링이 조정한 태스크 수가 다음 plan에서 diff로 잡히지 않도록 한다.
   lifecycle {
     ignore_changes = [desired_count]
   }
+}
 
-  tags = { Name = "${var.name}-consumer-svc" }
+# ---------------------------------------------------------------------------
+# 서비스 오토스케일링
+#
+# CPU가 아니라 타깃당 요청 수를 기준으로 삼는다.
+# 로그 수집은 I/O 바운드 작업이라 프로세서 사용률보다 요청률이 실제 부하를
+# 더 정확히 반영하기 때문이다.
+# ---------------------------------------------------------------------------
+
+resource "aws_appautoscaling_target" "api" {
+  service_namespace  = "ecs"
+  resource_id        = "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.api.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  min_capacity       = var.desired_count
+  max_capacity       = var.max_capacity
+}
+
+resource "aws_appautoscaling_policy" "requests" {
+  name               = "${var.name_prefix}-scale-on-requests"
+  policy_type        = "TargetTrackingScaling"
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+
+  target_tracking_scaling_policy_configuration {
+    target_value = var.requests_per_target
+
+    # 스케일 인은 느리게, 스케일 아웃은 빠르게. 트래픽 급증 시 유실 위험을
+    # 줄이는 방향으로 비대칭하게 설정한다.
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 60
+
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = var.alb_target_group_label
+    }
+  }
 }

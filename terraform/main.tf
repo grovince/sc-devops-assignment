@@ -1,136 +1,116 @@
-# ---------------------------------------------------------------------------
-# 로그 수집 파이프라인
-#
-#   ALB → ECS Fargate(API) → MSK → ECS Fargate(컨슈머) → S3
-#
-# 모듈 의존 방향을 한쪽으로만 흐르게 설계하여 순환 참조를 피한다.
-#
-#   storage ─┐
-#   vpc ─────┼─→ security ─→ endpoints
-#            │              ─→ msk ─────┐
-#            └──────────────→ alb ──────┼─→ ecs
-#
-# 네트워크 계층을 자체 모듈로 작성한 이유:
-# terraform-aws-modules/vpc를 쓰면 서브넷 3계층 분리와 CIDR 할당 근거가
-# 모듈 내부로 숨어 코드에서 드러나지 않는다. 본 과제는 설계 의도 표현을 우선했다.
-# ---------------------------------------------------------------------------
-
 locals {
-  name             = "${var.project}-${var.environment}"
-  metric_namespace = "${var.project}/Kafka"
+  name_prefix = "${var.project}-${var.environment}"
 }
 
-data "aws_caller_identity" "current" {}
+# ---------------------------------------------------------------------------
+# 1. 네트워크
+#
+# VPC, 가용 영역별 서브넷, 라우트 테이블, 그리고 NAT Gateway를 대체하는
+# VPC 엔드포인트를 생성한다.
+#
+# Interface Endpoint용 보안 그룹도 이 모듈에서 만든다. 엔드포인트는 생성
+# 시점에 보안 그룹 ID가 필요하고 security 모듈은 VPC ID가 필요하기 때문에,
+# 한쪽에 몰면 모듈 간 순환 참조가 발생한다. 규칙만 security 모듈에서 붙인다.
+# ---------------------------------------------------------------------------
 
-module "storage" {
-  source = "./modules/storage"
+module "network" {
+  source = "./modules/network"
 
-  name       = local.name
-  account_id = data.aws_caller_identity.current.account_id
-  raw_prefix = var.s3_raw_prefix
+  name_prefix = local.name_prefix
+  region      = var.region
+  vpc_cidr    = var.vpc_cidr
+  az_count    = var.az_count
 }
 
-module "vpc" {
-  source = "./modules/vpc"
-
-  name                = local.name
-  vpc_cidr            = var.vpc_cidr
-  azs                 = var.azs
-  public_subnet_cidrs = var.public_subnet_cidrs
-  app_subnet_cidrs    = var.app_subnet_cidrs
-  data_subnet_cidrs   = var.data_subnet_cidrs
-  flow_log_bucket_arn = module.storage.bucket_arn
-}
+# ---------------------------------------------------------------------------
+# 2. 보안
+#
+# 모든 보안 그룹 규칙과 WAFv2 Web ACL을 생성한다.
+# ALB가 보안 그룹과 Web ACL ARN을 모두 이 모듈에서 받아가므로 ALB보다 앞선다.
+#
+# S3 Gateway Endpoint는 ENI가 없어 보안 그룹으로 참조할 수 없다. 대신
+# 엔드포인트가 노출하는 prefix list ID를 사용한다. 별도 데이터 소스를 두면
+# plan 시점에 AWS API 호출이 발생하므로, 엔드포인트 속성을 그대로 넘긴다.
+# ---------------------------------------------------------------------------
 
 module "security" {
   source = "./modules/security"
 
-  name               = local.name
-  vpc_id             = module.vpc.vpc_id
-  region             = var.region
-  api_container_port = var.api_container_port
+  name_prefix         = local.name_prefix
+  vpc_id              = module.network.vpc_id
+  container_port      = var.container_port
+  alb_ingress_cidrs   = var.alb_ingress_cidrs
+  s3_prefix_list_id   = module.network.s3_prefix_list_id
+  vpc_endpoints_sg_id = module.network.vpc_endpoints_sg_id
+  rate_limit          = var.waf_rate_limit
 }
 
-# NAT Gateway를 생성하지 않는다.
-# 프라이빗 서브넷의 아웃바운드 요구사항(ECR 풀, CloudWatch Logs, Secrets, MSK IAM 인증)을
-# 모두 VPC Endpoint로 대체하여 0.0.0.0/0 경로 자체를 제거했다.
-module "endpoints" {
-  source = "./modules/endpoints"
+# ---------------------------------------------------------------------------
+# 3. 데이터 파이프라인
+#
+# ECS 태스크 역할이 PutRecords 권한을 스트림 ARN으로 좁히기 때문에
+# 컴퓨트 계층보다 먼저 선언한다.
+# ---------------------------------------------------------------------------
 
-  name                    = local.name
-  vpc_id                  = module.vpc.vpc_id
-  region                  = var.region
-  app_subnet_ids          = module.vpc.app_subnet_ids
-  private_route_table_ids = module.vpc.private_route_table_ids
-  security_group_id       = module.security.vpce_sg_id
-  interface_services      = var.interface_endpoint_services
-  account_id              = data.aws_caller_identity.current.account_id
+module "pipeline" {
+  source = "./modules/pipeline"
+
+  name_prefix         = local.name_prefix
+  region              = var.region
+  retention_hours     = var.kinesis_retention_hours
+  buffer_size_mb      = var.firehose_buffer_size_mb
+  buffer_interval_sec = var.firehose_buffer_interval_sec
+  log_expiration_days = var.log_expiration_days
 }
 
-module "msk" {
-  source = "./modules/msk"
-
-  name              = local.name
-  kafka_version     = var.kafka_version
-  subnet_ids        = module.vpc.data_subnet_ids
-  security_group_id = module.security.msk_sg_id
-  instance_type     = var.msk_instance_type
-  broker_count      = var.msk_broker_count
-  volume_size_gb    = var.msk_volume_size_gb
-  partitions        = var.log_topic_partitions
-  retention_hours   = var.log_retention_hours
-}
+# ---------------------------------------------------------------------------
+# 4. 로드 밸런서
+# ---------------------------------------------------------------------------
 
 module "alb" {
   source = "./modules/alb"
 
-  name              = local.name
-  vpc_id            = module.vpc.vpc_id
-  public_subnet_ids = module.vpc.public_subnet_ids
-  security_group_id = module.security.alb_sg_id
-  container_port    = var.api_container_port
-  certificate_arn   = var.certificate_arn
-  waf_rate_limit    = var.waf_rate_limit
+  name_prefix       = local.name_prefix
+  vpc_id            = module.network.vpc_id
+  public_subnet_ids = module.network.public_subnet_ids
+  alb_sg_id         = module.security.alb_sg_id
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
+  web_acl_arn       = module.security.web_acl_arn
 }
+
+# ---------------------------------------------------------------------------
+# 5. 컴퓨트
+# ---------------------------------------------------------------------------
 
 module "ecs" {
   source = "./modules/ecs"
 
-  name             = local.name
-  region           = var.region
-  metric_namespace = local.metric_namespace
+  name_prefix        = local.name_prefix
+  region             = var.region
+  private_subnet_ids = module.network.private_subnet_ids
+  ecs_tasks_sg_id    = module.security.ecs_tasks_sg_id
 
-  app_subnet_ids             = module.vpc.app_subnet_ids
-  api_security_group_id      = module.security.api_sg_id
-  consumer_security_group_id = module.security.consumer_sg_id
+  target_group_arn = module.alb.target_group_arn
 
-  target_group_arn        = module.alb.target_group_arn
-  alb_arn_suffix          = module.alb.arn_suffix
-  target_group_arn_suffix = module.alb.target_group_arn_suffix
-  https_listener_arn      = module.alb.https_listener_arn
+  # ALBRequestCountPerTarget 지표는 두 ARN suffix를 이어붙인
+  # app/<alb>/<id>/targetgroup/<tg>/<id> 형식을 요구한다.
+  alb_target_group_label = "${module.alb.alb_arn_suffix}/${module.alb.target_group_arn_suffix}"
 
-  msk_cluster_arn       = module.msk.cluster_arn
-  msk_topic_arn_pattern = module.msk.topic_arn_pattern
-  msk_group_arn_pattern = module.msk.group_arn_pattern
-  bootstrap_brokers     = module.msk.bootstrap_brokers_sasl_iam
-  msk_partitions        = module.msk.partitions
-  kafka_topic           = var.kafka_topic
-  consumer_group_id     = var.consumer_group_id
+  container_image    = var.container_image
+  container_port     = var.container_port
+  task_cpu           = var.task_cpu
+  task_memory        = var.task_memory
+  desired_count      = var.desired_count
+  log_retention_days = var.log_retention_days
 
-  s3_bucket_id  = module.storage.bucket_id
-  s3_bucket_arn = module.storage.bucket_arn
-  s3_raw_prefix = module.storage.raw_prefix
+  kinesis_stream_arn  = module.pipeline.kinesis_stream_arn
+  kinesis_stream_name = module.pipeline.kinesis_stream_name
 
-  api_image                = var.api_image
-  consumer_image           = var.consumer_image
-  api_container_port       = var.api_container_port
-  cpu_architecture         = var.cpu_architecture
-  api_min_capacity         = var.api_min_capacity
-  api_max_capacity         = var.api_max_capacity
-  api_target_request_count = var.api_target_request_count
-  consumer_min_capacity    = var.consumer_min_capacity
-  scheduled_scaling        = var.scheduled_scaling
-
-  # ALB 리스너와 MSK 클러스터가 완전히 생성된 후 서비스를 기동한다
-  depends_on = [module.alb, module.msk, module.endpoints]
+  # 리스너가 있어야 타깃 등록이 가능하고, 엔드포인트와 그 인그레스 규칙이
+  # 있어야 태스크가 이미지를 pull할 수 있다.
+  depends_on = [
+    module.alb,
+    module.security,
+  ]
 }

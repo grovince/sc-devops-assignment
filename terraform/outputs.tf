@@ -1,37 +1,90 @@
+# ---------------------------------------------------------------------------
+# 네트워크
+# ---------------------------------------------------------------------------
+
 output "vpc_id" {
-  value = module.vpc.vpc_id
+  description = "VPC의 ID."
+  value       = module.network.vpc_id
 }
 
-output "subnet_layout" {
-  description = "계층별 AZ 배치"
-  value       = module.vpc.subnet_layout
+output "public_subnet_ids" {
+  description = "퍼블릭 서브넷 ID 목록 (AZ별 1개)."
+  value       = module.network.public_subnet_ids
 }
 
-output "log_endpoint" {
-  description = "로그 수집 엔드포인트. POST https://<dns>/api/v1/logs"
-  value       = module.alb.dns_name
+output "private_subnet_ids" {
+  description = "프라이빗 서브넷 ID 목록 (AZ별 1개)."
+  value       = module.network.private_subnet_ids
 }
 
-output "msk_bootstrap_brokers" {
-  value     = module.msk.bootstrap_brokers_sasl_iam
-  sensitive = true
+output "availability_zones" {
+  description = "실제로 사용 중인 가용 영역 목록."
+  value       = module.network.availability_zones
 }
 
-output "s3_bucket" {
-  value = module.storage.bucket_id
+output "interface_endpoint_ids" {
+  description = "서비스별 Interface Endpoint ID."
+  value       = module.network.interface_endpoint_ids
 }
 
-output "consumer_max_capacity" {
-  description = "파티션 수와 동일. 초과 태스크는 유휴 상태가 된다"
-  value       = module.ecs.consumer_max_capacity
+output "s3_gateway_endpoint_id" {
+  description = "S3 Gateway Endpoint의 ID."
+  value       = module.network.s3_gateway_endpoint_id
 }
 
-output "nat_gateway_count" {
-  description = "NAT 미사용. 프라이빗 아웃바운드는 VPC Endpoint로 대체"
-  value       = 0
+# ---------------------------------------------------------------------------
+# 인그레스
+# ---------------------------------------------------------------------------
+
+output "api_endpoint" {
+  description = "로그 수집 API의 기본 URL."
+  value       = "http://${module.alb.alb_dns_name}"
 }
 
-output "interface_endpoint_count" {
-  description = "실제 과금 단위는 이 값 x AZ 수"
-  value       = module.endpoints.interface_endpoint_count
+output "log_ingest_url" {
+  description = "게임 로그를 POST할 전체 URL."
+  value       = "http://${module.alb.alb_dns_name}/api/v1/logs"
+}
+
+output "web_acl_arn" {
+  description = "ALB에 연결된 WAFv2 Web ACL의 ARN."
+  value       = module.security.web_acl_arn
+}
+
+# ---------------------------------------------------------------------------
+# 컴퓨트
+# ---------------------------------------------------------------------------
+
+output "ecs_cluster_name" {
+  description = "ECS 클러스터 이름."
+  value       = module.ecs.cluster_name
+}
+
+output "ecs_service_name" {
+  description = "ECS 서비스 이름."
+  value       = module.ecs.service_name
+}
+
+output "container_log_group" {
+  description = "컨테이너 로그가 적재되는 CloudWatch Logs 그룹."
+  value       = module.ecs.log_group_name
+}
+
+# ---------------------------------------------------------------------------
+# 데이터 파이프라인
+# ---------------------------------------------------------------------------
+
+output "kinesis_stream_name" {
+  description = "Kinesis Data Stream의 이름."
+  value       = module.pipeline.kinesis_stream_name
+}
+
+output "firehose_name" {
+  description = "Firehose 전송 스트림의 이름."
+  value       = module.pipeline.firehose_name
+}
+
+output "log_bucket_name" {
+  description = "게임 로그가 적재되는 S3 버킷."
+  value       = module.pipeline.log_bucket_name
 }

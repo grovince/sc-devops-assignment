@@ -1,54 +1,34 @@
-variable "name" {
-  type = string
-}
-
-variable "vpc_id" {
-  type = string
-}
-
-variable "public_subnet_ids" {
-  description = "ALB ENI가 생성될 서브넷. 지정한 서브넷마다 노드가 1개씩 생긴다"
-  type        = list(string)
-}
-
-variable "security_group_id" {
-  type = string
-}
-
-variable "container_port" {
-  type    = number
-  default = 8000
-}
-
-variable "certificate_arn" {
-  description = "HTTPS 리스너용 ACM 인증서 ARN"
+variable "name_prefix" {
+  description = "리소스 이름에 붙일 접두사."
   type        = string
 }
 
+variable "vpc_id" {
+  description = "VPC의 ID."
+  type        = string
+}
+
+variable "public_subnet_ids" {
+  description = "ALB가 걸쳐 배치될 퍼블릭 서브넷 ID 목록 (AZ별 1개)."
+  type        = list(string)
+}
+
+variable "alb_sg_id" {
+  description = "ALB에 부착할 보안 그룹 ID."
+  type        = string
+}
+
+variable "container_port" {
+  description = "API 서버가 listen하는 포트."
+  type        = number
+}
+
 variable "health_check_path" {
-  type    = string
-  default = "/health"
+  description = "타깃 그룹 헬스체크 경로."
+  type        = string
 }
 
-variable "deregistration_delay" {
-  description = "배포 시 인플라이트 요청 처리 유예. 컨테이너 graceful shutdown 시간보다 길어야 유실이 없다"
-  type        = number
-  default     = 30
-}
-
-variable "waf_rate_limit" {
-  description = "IP당 5분 기준 요청 상한. 정상 클라이언트 전송 빈도를 측정해 조정 필요"
-  type        = number
-  default     = 20000
-}
-
-variable "access_logs_bucket" {
-  type    = string
-  default = ""
-}
-
-variable "enable_access_logs" {
-  description = "초당 수만 건 환경에서는 액세스 로그 자체가 대용량이므로 기본 비활성"
-  type        = bool
-  default     = false
+variable "web_acl_arn" {
+  description = "이 ALB에 연결할 WAFv2 Web ACL의 ARN."
+  type        = string
 }

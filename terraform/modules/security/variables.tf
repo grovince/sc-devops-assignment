@@ -1,23 +1,34 @@
-variable "name" {
-  type = string
-}
-
-variable "vpc_id" {
-  type = string
-}
-
-variable "region" {
-  description = "S3 prefix list 조회용"
+variable "name_prefix" {
+  description = "리소스 이름에 붙일 접두사."
   type        = string
 }
 
-variable "api_container_port" {
-  type    = number
-  default = 8000
+variable "vpc_id" {
+  description = "보안 그룹이 속할 VPC의 ID."
+  type        = string
 }
 
-variable "msk_port" {
-  description = "MSK 인증 포트. IAM=9098, SASL/SCRAM=9096, TLS=9094"
+variable "container_port" {
+  description = "API 서버가 listen하는 포트."
   type        = number
-  default     = 9098
+}
+
+variable "alb_ingress_cidrs" {
+  description = "ALB 접근을 허용할 CIDR 블록 목록."
+  type        = list(string)
+}
+
+variable "s3_prefix_list_id" {
+  description = "S3 Gateway Endpoint의 관리형 prefix list ID. 이그레스 규칙에 사용된다."
+  type        = string
+}
+
+variable "vpc_endpoints_sg_id" {
+  description = "network 모듈이 생성한 Interface Endpoint용 보안 그룹 ID."
+  type        = string
+}
+
+variable "rate_limit" {
+  description = "단일 IP의 5분 윈도우당 최대 요청 수."
+  type        = number
 }

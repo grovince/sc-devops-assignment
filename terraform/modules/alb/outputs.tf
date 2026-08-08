@@ -1,26 +1,34 @@
-output "dns_name" {
-  description = "로그 수집 엔드포인트. POST /api/v1/logs"
+output "alb_arn" {
+  description = "Application Load Balancer의 ARN."
+  value       = aws_lb.this.arn
+}
+
+output "alb_dns_name" {
+  description = "ALB의 퍼블릭 DNS 이름."
   value       = aws_lb.this.dns_name
 }
 
-output "zone_id" {
-  value = aws_lb.this.zone_id
+output "alb_zone_id" {
+  description = "ALB의 호스팅 영역 ID. Route 53 alias 레코드에 사용된다."
+  value       = aws_lb.this.zone_id
 }
 
 output "target_group_arn" {
-  value = aws_lb_target_group.api.arn
+  description = "API 타깃 그룹의 ARN."
+  value       = aws_lb_target_group.api.arn
 }
 
-output "arn_suffix" {
-  description = "ALBRequestCountPerTarget 오토스케일링의 resource_label 구성에 사용"
+output "listener_arn" {
+  description = "HTTP 리스너의 ARN."
+  value       = aws_lb_listener.http.arn
+}
+
+output "alb_arn_suffix" {
+  description = "ALB의 ARN suffix. app/<name>/<id> 형식."
   value       = aws_lb.this.arn_suffix
 }
 
 output "target_group_arn_suffix" {
-  value = aws_lb_target_group.api.arn_suffix
-}
-
-output "https_listener_arn" {
-  description = "ECS 서비스의 depends_on 대상"
-  value       = aws_lb_listener.https.arn
+  description = "타깃 그룹의 ARN suffix. targetgroup/<name>/<id> 형식."
+  value       = aws_lb_target_group.api.arn_suffix
 }

@@ -1,79 +1,79 @@
-# ---------------------------------------------------------------------------
-# ALB
-#
-# ALB는 단일 장비가 아니라 지정한 서브넷마다 ENI를 1개씩 갖는 분산 시스템이다.
-# public_subnet_ids에 3개를 지정하면 각 AZ에 노드가 생성되고,
-# DNS 조회 시 해당 IP들이 반환된다.
-#
-# cross-zone load balancing은 ALB에서 항상 활성이며 비활성화할 수 없다.
-# 특정 AZ로 유입된 요청도 타 AZ의 태스크로 분산된다.
-# ---------------------------------------------------------------------------
-resource "aws_lb" "this" {
-  name               = "${var.name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  subnets            = var.public_subnet_ids
-  security_groups    = [var.security_group_id]
-
-  idle_timeout               = 60
-  enable_deletion_protection = false
-  drop_invalid_header_fields = true
-
-  dynamic "access_logs" {
-    for_each = var.enable_access_logs && var.access_logs_bucket != "" ? [1] : []
-    content {
-      bucket  = var.access_logs_bucket
-      prefix  = "alb-access-logs"
-      enabled = true
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
     }
   }
-
-  tags = { Name = "${var.name}-alb" }
 }
 
+# ---------------------------------------------------------------------------
+# Application Load Balancer
+# ---------------------------------------------------------------------------
+
+resource "aws_lb" "this" {
+  name               = "${var.name_prefix}-alb"
+  load_balancer_type = "application"
+  internal           = false
+
+  # 가용 영역별 퍼블릭 서브넷에 걸쳐 배치되어 부하를 분산한다.
+  subnets         = var.public_subnet_ids
+  security_groups = [var.alb_sg_id]
+
+  drop_invalid_header_fields = true
+  enable_deletion_protection = false
+
+  # 로그 전송 클라이언트는 버스트 사이에도 연결을 유지하는 경우가 많다.
+  idle_timeout = 60
+
+  tags = {
+    Name = "${var.name_prefix}-alb"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 타깃 그룹
+#
+# Fargate 태스크는 awsvpc 네트워크 모드를 사용해 ENI 주소로 등록되므로
+# target_type은 반드시 "ip"여야 한다. "instance"는 사용할 수 없다.
+# ---------------------------------------------------------------------------
+
 resource "aws_lb_target_group" "api" {
-  name        = "${var.name}-api-tg"
+  name        = "${var.name_prefix}-tg"
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
-  target_type = "ip" # Fargate awsvpc 모드는 ip 타입 필수
+  target_type = "ip"
 
-  deregistration_delay = var.deregistration_delay
+  # Fargate는 태스크를 오래 드레이닝하지 않고 교체한다. 값을 짧게 두면
+  # 처리 중인 요청을 끊지 않으면서도 롤링 배포가 빨라진다.
+  deregistration_delay = 30
 
   health_check {
+    enabled             = true
     path                = var.health_check_path
-    interval            = 15
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
     timeout             = 5
     healthy_threshold   = 2
     unhealthy_threshold = 3
-    matcher             = "200"
   }
 
-  tags = { Name = "${var.name}-api-tg" }
+  tags = {
+    Name = "${var.name_prefix}-tg"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_lb_listener" "http_redirect" {
+resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.this.arn
   port              = 80
   protocol          = "HTTP"
-
-  default_action {
-    type = "redirect"
-
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
-  }
-}
-
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = var.certificate_arn
 
   default_action {
     type             = "forward"
@@ -81,91 +81,33 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# ---------------------------------------------------------------------------
-# WAF
-#
-# 로그 수집 API의 현실적 위협은 데이터 유출이 아니라 오염과 비용이다.
-# 가짜 로그를 대량 주입하면 분석 데이터가 왜곡되고 MSK/S3 비용이 그대로 청구된다.
-# 애플리케이션 레벨 인증(API 키, 세션 토큰)과 함께 1차 방어선으로 둔다.
-# ---------------------------------------------------------------------------
-resource "aws_wafv2_web_acl" "this" {
-  name  = "${var.name}-waf"
-  scope = "REGIONAL"
+# 로그 수집 경로에 대한 명시적 규칙. 현재 동작은 기본 액션과 동일하지만,
+# 이후 경로별 처리(별도 타깃 그룹, 전용 WAF 규칙, 다른 스로틀링 정책)를
+# 붙일 지점을 미리 확보해 둔다.
+resource "aws_lb_listener_rule" "logs" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 100
 
-  default_action {
-    allow {}
-  }
-
-  rule {
-    name     = "rate-limit-per-ip"
-    priority = 1
-
-    action {
-      block {}
-    }
-
-    statement {
-      rate_based_statement {
-        limit              = var.waf_rate_limit
-        aggregate_key_type = "IP"
-      }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "rate-limit"
-      sampled_requests_enabled   = true
+  condition {
+    path_pattern {
+      values = ["/api/v1/logs", "/api/v1/logs/*"]
     }
   }
 
-  rule {
-    name     = "aws-common-rules"
-    priority = 2
-
-    override_action {
-      none {}
-    }
-
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesCommonRuleSet"
-      }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "common-rules"
-      sampled_requests_enabled   = true
-    }
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
   }
-
-  visibility_config {
-    cloudwatch_metrics_enabled = true
-    metric_name                = "${var.name}-waf"
-    sampled_requests_enabled   = true
-  }
-
-  tags = { Name = "${var.name}-waf" }
 }
+
+# ---------------------------------------------------------------------------
+# WAF 연결
+#
+# Web ACL 자체는 security 모듈에서 정의한다.
+# WAF는 트래픽 경로상의 홉이 아니라 이 로드 밸런서에 부착되는 정책이다.
+# ---------------------------------------------------------------------------
 
 resource "aws_wafv2_web_acl_association" "this" {
   resource_arn = aws_lb.this.arn
-  web_acl_arn  = aws_wafv2_web_acl.this.arn
-}
-
-resource "aws_cloudwatch_metric_alarm" "target_5xx" {
-  alarm_name          = "${var.name}-alb-5xx"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "HTTPCode_Target_5XX_Count"
-  namespace           = "AWS/ApplicationELB"
-  period              = 60
-  statistic           = "Sum"
-  threshold           = 100
-
-  dimensions = {
-    LoadBalancer = aws_lb.this.arn_suffix
-    TargetGroup  = aws_lb_target_group.api.arn_suffix
-  }
+  web_acl_arn  = var.web_acl_arn
 }
