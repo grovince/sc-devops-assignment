@@ -1,4 +1,4 @@
-# 게임 로그 수집 파이프라인
+# 로그 수집 파이프라인
 
 ```
 curl → nginx(:8000) → api (FastAPI, N replicas) → Kafka (KRaft)
@@ -187,3 +187,9 @@ docker compose logs api --tail 20
 - **`is_ready`** — start 성공 여부만 반영함. 헬스체크마다 브로커를 왕복하는 것은 그 자체로 부하이므로 택한 타협임
 - **네트워크 분리** — 호스트 포트를 nginx 하나로 제한한 구성에서 추가 이득이 작아 기본 네트워크를 사용함. 프로덕션에서는 서브넷·보안 그룹으로 분리함
 - **스키마 최소 검증** — 게임 로그는 업데이트마다 필드가 바뀌므로 전체 검증은 수집 서버 재배포를 강제함. 나머지는 `payload`로 통과시키고 스키마 강제는 분석 계층의 책임으로 둠
+
+---
+
+# AWS 구성
+<img width="1212" height="1452" alt="sc 사전과제 aws drawio" src="https://github.com/user-attachments/assets/18eb7d67-c003-4379-b244-4f1ccdb31c08" />
+
