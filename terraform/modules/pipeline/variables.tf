@@ -3,11 +3,6 @@ variable "name_prefix" {
   type        = string
 }
 
-variable "region" {
-  description = "AWS 리전. IAM 조건 키에 사용된다."
-  type        = string
-}
-
 variable "retention_hours" {
   description = "Kinesis Data Streams 보존 기간 (시간)."
   type        = number

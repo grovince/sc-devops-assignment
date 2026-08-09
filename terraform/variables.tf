@@ -136,7 +136,7 @@ variable "firehose_buffer_interval_sec" {
 }
 
 variable "log_expiration_days" {
-  description = "게임 로그 객체의 만료 기간 (일). 0으로 두면 만료를 적용하지 않는다."
+  description = "게임 로그 객체의 만료 기간 (일)"
   type        = number
   default     = 365
 }

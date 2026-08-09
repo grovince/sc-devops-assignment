@@ -36,16 +36,7 @@ resource "aws_s3_bucket_public_access_block" "logs" {
   restrict_public_buckets = true
 }
 
-# ACL을 비활성화하고 소유권을 버킷 소유자로 고정한다.
-resource "aws_s3_bucket_ownership_controls" "logs" {
-  bucket = aws_s3_bucket.logs.id
-
-  rule {
-    object_ownership = "BucketOwnerEnforced"
-  }
-}
-
-# 서버 측 암호화(AES256). bucket_key를 켜면 KMS 요청 비용을 줄일 수 있다.
+# 서버 측 암호화(SSE-S3, AES256)를 적용한다.
 resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
   bucket = aws_s3_bucket.logs.id
 
@@ -53,25 +44,12 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 
-resource "aws_s3_bucket_versioning" "logs" {
-  bucket = aws_s3_bucket.logs.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# 게임 로그는 한 번 적재되고 이후에는 드물게 조회된다.
-# 계층 전환으로 데이터가 늘어도 스토리지 비용이 급격히 오르지 않게 하고,
-# 실패한 멀티파트 업로드가 쌓이지 않도록 정리 규칙을 둔다.
+# 적재 후 조회 빈도가 급격히 떨어지는 데이터 특성에 맞춰 계층을 전환한다.
 resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   bucket = aws_s3_bucket.logs.id
-
-  depends_on = [aws_s3_bucket_versioning.logs]
 
   rule {
     id     = "tier-and-expire"
@@ -89,16 +67,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
       storage_class = "GLACIER_IR"
     }
 
-    # log_expiration_days가 0이면 만료 규칙 자체를 생성하지 않는다.
-    dynamic "expiration" {
-      for_each = var.log_expiration_days > 0 ? [1] : []
-      content {
-        days = var.log_expiration_days
-      }
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
+    expiration {
+      days = var.log_expiration_days
     }
   }
 }
@@ -107,7 +77,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 # Kinesis Data Streams
 #
 # On-Demand 모드를 사용해 샤드 수를 직접 산정하지 않는다.
-# AWS가 직전 30일 최대 쓰기 처리량의 2배까지 용량을 자동 조정한다.
+# 게임 로그는 시간대별 트래픽 편차가 커서 고정 샤드로는
+# 피크에 스로틀링이 발생하거나 평시에 용량이 낭비된다.
 # ---------------------------------------------------------------------------
 
 resource "aws_kinesis_stream" "logs" {
@@ -118,16 +89,6 @@ resource "aws_kinesis_stream" "logs" {
     stream_mode = "ON_DEMAND"
   }
 
-  encryption_type = "KMS"
-  kms_key_id      = "alias/aws/kinesis"
-
-  # 처리량 초과를 조기에 감지하기 위한 샤드 단위 지표.
-  shard_level_metrics = [
-    "IncomingBytes",
-    "IncomingRecords",
-    "WriteProvisionedThroughputExceeded",
-  ]
-
   tags = {
     Name = "${var.name_prefix}-stream"
   }
@@ -136,8 +97,7 @@ resource "aws_kinesis_stream" "logs" {
 # ---------------------------------------------------------------------------
 # Firehose IAM 역할
 #
-# 스트림에서 읽고 S3에 쓴다. 스트림이 AWS 관리형 Kinesis 키로 암호화되어
-# 있으므로 복호화 권한도 함께 필요하다.
+# 스트림에서 읽어 S3에 쓰고, 전송 로그를 CloudWatch에 남긴다.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "firehose_assume" {
@@ -148,13 +108,6 @@ data "aws_iam_policy_document" "firehose_assume" {
     principals {
       type        = "Service"
       identifiers = ["firehose.amazonaws.com"]
-    }
-
-    # 혼동된 대리인(confused deputy) 문제를 막기 위한 계정 한정 조건.
-    condition {
-      test     = "StringEquals"
-      variable = "sts:ExternalId"
-      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 }
@@ -170,28 +123,11 @@ data "aws_iam_policy_document" "firehose" {
     effect = "Allow"
     actions = [
       "kinesis:DescribeStream",
-      "kinesis:DescribeStreamSummary",
       "kinesis:GetShardIterator",
       "kinesis:GetRecords",
       "kinesis:ListShards",
     ]
     resources = [aws_kinesis_stream.logs.arn]
-  }
-
-  statement {
-    sid    = "DecryptStream"
-    effect = "Allow"
-    actions = [
-      "kms:Decrypt",
-      "kms:GenerateDataKey",
-    ]
-    resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "kms:ViaService"
-      values   = ["kinesis.${var.region}.amazonaws.com"]
-    }
   }
 
   statement {
@@ -256,20 +192,14 @@ resource "aws_kinesis_firehose_delivery_stream" "logs" {
     bucket_arn = aws_s3_bucket.logs.arn
 
     # 크기와 시간 중 먼저 도달하는 조건에서 S3로 flush한다.
-    # 값을 키우면 객체가 커져 Athena 스캔 효율이 좋아지고,
-    # 줄이면 데이터 신선도가 올라간다.
     buffering_size     = var.buffer_size_mb
     buffering_interval = var.buffer_interval_sec
 
     compression_format = "GZIP"
 
-    # Hive 스타일 시간 파티셔닝. Athena가 전체 버킷을 스캔하지 않고
-    # 시간 범위로 프루닝할 수 있게 한다.
-    #
-    # timestamp 네임스페이스는 Firehose가 자체적으로 평가하므로
-    # 동적 파티셔닝(dynamic partitioning) 설정이 필요하지 않다.
-    # 동적 파티셔닝은 64~128MiB 버퍼를 요구해 위 설정과 충돌한다.
+    # 시간 단위 파티셔닝. 조회 시 전체 버킷을 스캔하지 않아도 된다.
     prefix              = "logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+    # S3 전송에 실패한 레코드를 별도 경로에 남겨 유실을 방지한다.
     error_output_prefix = "errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
 
     cloudwatch_logging_options {

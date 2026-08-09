@@ -25,10 +25,10 @@ data "aws_availability_zones" "available" {
 locals {
   azs = slice(data.aws_availability_zones.available.names, 0, var.az_count)
 
-  # 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24 ...
+  # 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24
   public_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
 
-  # 10.0.10.0/24, 10.0.11.0/24, 10.0.12.0/24 ...
+  # 10.0.10.0/24, 10.0.11.0/24, 10.0.12.0/24
   private_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i + 10)]
 
   # Interface Endpoint는 지정한 서브넷마다 ENI를 생성한다.
@@ -96,7 +96,7 @@ resource "aws_subnet" "private" {
   cidr_block        = local.private_cidrs[count.index]
   availability_zone = local.azs[count.index]
 
-  # 퍼블릭 IP를 부여하지 않는다. 외부 통신은 NAT Gateway가 아니라
+  # 퍼블릭 IP를 부여하지 않는다.
   # VPC 엔드포인트를 통해서만 이루어진다.
   map_public_ip_on_launch = false
 
@@ -135,15 +135,13 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# 프라이빗 라우트 테이블은 AZ별로 분리한다. S3 Gateway Endpoint 연결과
-# 향후 AZ별 라우팅 변경을 서로 독립적으로 다루기 위함이다.
+# NAT를 쓰지 않아 AZ별로 달라질 라우팅이 없으므로 프라이빗 라우트 테이블은 하나만 둔다.
+# (NAT/TGW 도입 시에는 AZ별 분리 필요)
 resource "aws_route_table" "private" {
-  count = var.az_count
-
   vpc_id = aws_vpc.this.id
 
   tags = {
-    Name = "${var.name_prefix}-rt-private-${local.azs[count.index]}"
+    Name = "${var.name_prefix}-rt-private"
   }
 }
 
@@ -151,7 +149,7 @@ resource "aws_route_table_association" "private" {
   count = var.az_count
 
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
+  route_table_id = aws_route_table.private.id
 }
 
 # ---------------------------------------------------------------------------
@@ -166,9 +164,17 @@ resource "aws_route_table_association" "private" {
 # ---------------------------------------------------------------------------
 
 resource "aws_security_group" "vpc_endpoints" {
-  name        = "${var.name_prefix}-vpce-sg"
+  name_prefix = "${var.name_prefix}-vpce-"
   description = "VPC Interface Endpoint ENI에 부착되는 보안 그룹"
   vpc_id      = aws_vpc.this.id
+
+  egress {
+    description = "VPC 내부로의 HTTPS 응답"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
 
   tags = {
     Name = "${var.name_prefix}-vpce-sg"
@@ -208,6 +214,7 @@ resource "aws_vpc_endpoint" "interface" {
 # 무료이며 ENI가 아니라 라우트 테이블 항목으로 동작한다.
 # ECR이 이미지 레이어를 S3에 저장하므로, NAT Gateway가 없는 서브넷에서는
 # 이 엔드포인트가 없으면 이미지 pull 자체가 실패한다.
+# 프라이빗 라우트 테이블이 하나뿐이므로 연결 대상도 하나다.
 # ---------------------------------------------------------------------------
 
 resource "aws_vpc_endpoint" "s3" {
@@ -215,7 +222,7 @@ resource "aws_vpc_endpoint" "s3" {
   service_name      = "com.amazonaws.${var.region}.s3"
   vpc_endpoint_type = "Gateway"
 
-  route_table_ids = aws_route_table.private[*].id
+  route_table_ids = [aws_route_table.private.id]
 
   tags = {
     Name = "${var.name_prefix}-vpce-s3"

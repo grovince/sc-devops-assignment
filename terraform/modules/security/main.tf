@@ -13,8 +13,8 @@ terraform {
 #
 # 최소 권한 원칙에 따라, 모든 규칙은 CIDR이 아니라 상대 보안 그룹을 참조한다.
 # 예외는 두 가지다.
-#   - ALB의 퍼블릭 인그레스 (외부 클라이언트라 참조할 SG가 없음)
-#   - S3로의 이그레스 (Gateway Endpoint라 ENI가 없어 prefix list를 사용)
+#   - ALB의 Public Ingress (외부 클라이언트라 참조할 SG가 없음)
+#   - S3로의 Egress (Gateway Endpoint라 ENI가 없어 prefix list를 사용)
 #
 # 트래픽 체인:
 #   인터넷 -> ALB :80/:443 -> ECS 태스크 :container_port -> 엔드포인트 :443
@@ -26,7 +26,7 @@ terraform {
 
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
-  description = "퍼블릭 ALB로 들어오는 인터넷 트래픽"
+  description = "ALB로 들어오는 인터넷 트래픽"
   vpc_id      = var.vpc_id
 
   tags = {

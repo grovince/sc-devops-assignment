@@ -56,7 +56,6 @@ module "pipeline" {
   source = "./modules/pipeline"
 
   name_prefix         = local.name_prefix
-  region              = var.region
   retention_hours     = var.kinesis_retention_hours
   buffer_size_mb      = var.firehose_buffer_size_mb
   buffer_interval_sec = var.firehose_buffer_interval_sec

@@ -1,26 +1,21 @@
 output "vpc_id" {
-  description = "VPC의 ID."
+  description = "VPC의 ID"
   value       = aws_vpc.this.id
 }
 
 output "vpc_cidr" {
-  description = "VPC의 CIDR 블록."
+  description = "VPC의 CIDR 블록"
   value       = aws_vpc.this.cidr_block
 }
 
 output "public_subnet_ids" {
-  description = "퍼블릭 서브넷 ID 목록 (AZ별 1개)."
+  description = "퍼블릭 서브넷 ID 목록 (AZ별 1개)"
   value       = aws_subnet.public[*].id
 }
 
 output "private_subnet_ids" {
-  description = "프라이빗 서브넷 ID 목록 (AZ별 1개)."
+  description = "프라이빗 서브넷 ID 목록 (AZ별 1개)"
   value       = aws_subnet.private[*].id
-}
-
-output "private_route_table_ids" {
-  description = "프라이빗 라우트 테이블 ID 목록."
-  value       = aws_route_table.private[*].id
 }
 
 output "availability_zones" {
@@ -34,7 +29,7 @@ output "vpc_endpoints_sg_id" {
 }
 
 output "interface_endpoint_ids" {
-  description = "서비스 이름을 키로 하는 Interface Endpoint ID 맵."
+  description = "서비스 이름을 키로 하는 Interface Endpoint ID 맵"
   value       = { for k, v in aws_vpc_endpoint.interface : k => v.id }
 }
 
