@@ -23,8 +23,8 @@ class LogEvent(BaseModel):
 
     # 멱등 적재 키. Kafka 전송 '이전에' 값이 확정되므로,
     # 같은 Kafka 레코드가 재소비되어도 event_id가 동일하다.
-    # -> 컨슈머가 MongoDB unique index로 중복 insert를 걸러낼 수 있다.
-    #
+    # -> 파일 싱크는 at-least-once라 컨슈머 재시작 시 중복이 남을 수 있는데,
+    #    분석 계층에서 event_id 기준 dedup으로 정확히 한 번을 복원할 수 있다.
     # 클라이언트가 직접 보내면 그 값을 쓴다(재시도까지 포함한 end-to-end 멱등).
     # 없으면 API가 생성한다(컨슈머->DB 구간의 멱등만 보장).
     event_id: str = Field(default_factory=lambda: str(uuid4()), max_length=64)

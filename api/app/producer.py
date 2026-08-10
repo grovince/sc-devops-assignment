@@ -48,7 +48,7 @@ class KafkaLogProducer:
             #     장애에도 유실 없음 (로컬 RF=1에서는 리더 확인과 동일하며,
             #     프로덕션 RF=3 + min.insync.replicas=2에서 의미가 완성된다)
             #   - idempotence: 프로듀서 재시도로 인한 브로커 내 중복/순서
-            #     꼬임을 제거 (컨슈머->DB 구간 중복은 event_id가 담당)
+            #     꼬임을 제거 (컨슈머 재시작 구간의 중복은 event_id로 다운스트림에서 제거)
             acks="all",
             enable_idempotence=True,
             # ------------------------------------------------

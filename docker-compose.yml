@@ -1,7 +1,7 @@
 # =============================================================================
 # 로그 수집 파이프라인 로컬 검증 환경
 #
-#   curl -> nginx(:8000) -> api(FastAPI, N replicas) -> Kafka(KRaft)
+#     curl -> nginx(:8000) -> api(FastAPI, N replicas) -> Kafka(KRaft) -> consumer -> 파일 볼륨
 #
 # 기동:      docker compose up -d --build
 # 확장 시연: docker compose up -d --scale api=3
@@ -10,9 +10,9 @@
 #   docker exec log-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 #     --bootstrap-server localhost:9092 --topic game-logs --from-beginning
 #
-# 스코프 노트: 큐 이후 구간(컨슈머 -> DB 적재)은 의도적으로 제외했다.
-# 과제 B안의 요구는 '큐로 받아내는 구조'에서 충족되며,
-# 확장 시의 구조(수동 커밋 + event_id unique index 멱등 적재)는 README에 기술. => 이거 컨슈머랑 몽고디비 말하는거임
+# 싱크로 파일(JSONL)을 택한 이유: 로그는 append-only 시계열 데이터라
+# 문서/관계형 DB의 인덱스·갱신 기능이 필요하지 않다. 프로덕션에서는
+# 이 자리가 그대로 S3가 된다 (Firehose -> S3 -> Athena).
 #
 # 이 compose는 '기능 검증용'이다. Kafka RF=1, min.insync.replicas=1이며,
 # 프로덕션(MSK)에서는 RF=3 + min.insync.replicas=2 + acks=all 조합이어야
@@ -139,7 +139,27 @@ services:
       ]
     restart: "no"
 
+
+# ---------------------------------------------------------------------------
+  # consumer: Kafka -> 파일 싱크 (프로덕션의 Firehose -> S3에 대응)
+  # ---------------------------------------------------------------------------
+  consumer:
+    build: ./consumer
+    container_name: log-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: game-logs
+    volumes:
+      - log-data:/data/logs
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 # 컨테이너를 지워도(docker compose down) 데이터는 남는다.
 # 데이터까지 초기화하려면: docker compose down -v
 volumes:
   kafka-data:
+  log-data:
