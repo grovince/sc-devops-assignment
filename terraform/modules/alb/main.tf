@@ -22,10 +22,6 @@ resource "aws_lb" "this" {
   security_groups = [var.alb_sg_id]
 
   drop_invalid_header_fields = true
-  enable_deletion_protection = false
-
-  # 로그 전송 클라이언트는 버스트 사이에도 연결을 유지하는 경우가 많다.
-  idle_timeout = 60
 
   tags = {
     Name = "${var.name_prefix}-alb"
@@ -64,10 +60,6 @@ resource "aws_lb_target_group" "api" {
   tags = {
     Name = "${var.name_prefix}-tg"
   }
-
-  lifecycle {
-    create_before_destroy = true
-  }
 }
 
 resource "aws_lb_listener" "http" {
@@ -76,25 +68,6 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.api.arn
-  }
-}
-
-# 로그 수집 경로에 대한 명시적 규칙. 현재 동작은 기본 액션과 동일하지만,
-# 이후 경로별 처리(별도 타깃 그룹, 전용 WAF 규칙, 다른 스로틀링 정책)를
-# 붙일 지점을 미리 확보해 둔다.
-resource "aws_lb_listener_rule" "logs" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 100
-
-  condition {
-    path_pattern {
-      values = ["/api/v1/logs", "/api/v1/logs/*"]
-    }
-  }
-
-  action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.api.arn
   }

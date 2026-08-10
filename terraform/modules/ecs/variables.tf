@@ -24,7 +24,7 @@ variable "target_group_arn" {
 }
 
 variable "alb_target_group_label" {
-  description = "ALBRequestCountPerTarget 지표용 리소스 레이블. app/<alb>/<id>/targetgroup/<tg>/<id> 형식."
+  description = "ALBRequestCountPerTarget 지표용 리소스 레이블"
   type        = string
 }
 

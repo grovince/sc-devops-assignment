@@ -165,11 +165,11 @@ resource "aws_route_table_association" "private" {
 
 resource "aws_security_group" "vpc_endpoints" {
   name_prefix = "${var.name_prefix}-vpce-"
-  description = "VPC Interface Endpoint ENI에 부착되는 보안 그룹"
+  description = "Security group for VPC Interface Endpoint ENIs"
   vpc_id      = aws_vpc.this.id
 
   egress {
-    description = "VPC 내부로의 HTTPS 응답"
+    description = "HTTPS to VPC internal"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"

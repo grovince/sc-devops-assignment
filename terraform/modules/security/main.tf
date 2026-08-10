@@ -26,7 +26,7 @@ terraform {
 
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
-  description = "ALB로 들어오는 인터넷 트래픽"
+  description = "Internet-facing ALB for log collection API"
   vpc_id      = var.vpc_id
 
   tags = {
@@ -42,7 +42,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   count = length(var.alb_ingress_cidrs)
 
   security_group_id = aws_security_group.alb.id
-  description       = "허용된 클라이언트로부터의 HTTP"
+  description = "HTTP from allowed clients"
   cidr_ipv4         = var.alb_ingress_cidrs[count.index]
   from_port         = 80
   to_port           = 80
@@ -53,7 +53,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_https" {
   count = length(var.alb_ingress_cidrs)
 
   security_group_id = aws_security_group.alb.id
-  description       = "허용된 클라이언트로부터의 HTTPS"
+  description = "HTTPS from allowed clients"
   cidr_ipv4         = var.alb_ingress_cidrs[count.index]
   from_port         = 443
   to_port           = 443
@@ -62,7 +62,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_https" {
 
 resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
   security_group_id            = aws_security_group.alb.id
-  description                  = "ECS 태스크의 컨테이너 포트로 전달"
+  description = "Forward to ECS task container port"
   referenced_security_group_id = aws_security_group.ecs_tasks.id
   from_port                    = var.container_port
   to_port                      = var.container_port
@@ -78,7 +78,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
 
 resource "aws_security_group" "ecs_tasks" {
   name        = "${var.name_prefix}-ecs-tasks-sg"
-  description = "프라이빗 서브넷에서 실행되는 Fargate 기반 로그 API 태스크"
+  description = "Fargate log API tasks in private subnets"
   vpc_id      = var.vpc_id
 
   tags = {
@@ -92,7 +92,7 @@ resource "aws_security_group" "ecs_tasks" {
 
 resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
   security_group_id            = aws_security_group.ecs_tasks.id
-  description                  = "ALB로부터의 컨테이너 포트 접근"
+  description = "Container port from ALB"
   referenced_security_group_id = aws_security_group.alb.id
   from_port                    = var.container_port
   to_port                      = var.container_port
@@ -101,7 +101,7 @@ resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
 
 resource "aws_vpc_security_group_egress_rule" "tasks_to_endpoints" {
   security_group_id            = aws_security_group.ecs_tasks.id
-  description                  = "VPC Interface Endpoint(Kinesis, ECR, Logs)로의 HTTPS"
+  description = "HTTPS to VPC Interface Endpoints (Kinesis, ECR, Logs)"
   referenced_security_group_id = var.vpc_endpoints_sg_id
   from_port                    = 443
   to_port                      = 443
@@ -112,7 +112,7 @@ resource "aws_vpc_security_group_egress_rule" "tasks_to_endpoints" {
 # 보안 그룹 참조 대신 관리형 prefix list를 사용해야 한다.
 resource "aws_vpc_security_group_egress_rule" "tasks_to_s3" {
   security_group_id = aws_security_group.ecs_tasks.id
-  description       = "Gateway Endpoint를 통한 S3 HTTPS 접근 (ECR 이미지 레이어)"
+  description = "HTTPS to S3 via Gateway Endpoint for ECR image layers"
   prefix_list_id    = var.s3_prefix_list_id
   from_port         = 443
   to_port           = 443
@@ -129,7 +129,7 @@ resource "aws_vpc_security_group_egress_rule" "tasks_to_s3" {
 
 resource "aws_vpc_security_group_ingress_rule" "endpoints_from_tasks" {
   security_group_id            = var.vpc_endpoints_sg_id
-  description                  = "ECS 태스크로부터의 HTTPS"
+  description = "HTTPS from ECS tasks"
   referenced_security_group_id = aws_security_group.ecs_tasks.id
   from_port                    = 443
   to_port                      = 443
@@ -146,7 +146,7 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_from_tasks" {
 
 resource "aws_wafv2_web_acl" "this" {
   name        = "${var.name_prefix}-waf"
-  description = "로그 수집 ALB에 적용할 요청 제한 및 관리형 규칙"
+  description = "Rate limiting and managed rules for log collection ALB"
   scope       = "REGIONAL"
 
   default_action {

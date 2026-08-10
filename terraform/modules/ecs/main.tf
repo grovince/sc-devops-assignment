@@ -15,23 +15,8 @@ terraform {
 resource "aws_ecs_cluster" "this" {
   name = "${var.name_prefix}-cluster"
 
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-
   tags = {
     Name = "${var.name_prefix}-cluster"
-  }
-}
-
-resource "aws_ecs_cluster_capacity_providers" "this" {
-  cluster_name       = aws_ecs_cluster.this.name
-  capacity_providers = ["FARGATE"]
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 1
   }
 }
 
@@ -68,7 +53,7 @@ data "aws_iam_policy_document" "ecs_assume" {
 
 resource "aws_iam_role" "execution" {
   name               = "${var.name_prefix}-task-execution-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json #위에 만든 aws_iam_policy_document 정책을 Role에 설정
 }
 
 resource "aws_iam_role_policy_attachment" "execution_managed" {
@@ -98,23 +83,6 @@ data "aws_iam_policy_document" "task" {
       "kinesis:DescribeStreamSummary",
     ]
     resources = [var.kinesis_stream_arn]
-  }
-
-  # 스트림이 KMS로 암호화되어 있어 쓰기 시 데이터 키 생성 권한이 필요하다.
-  # kms:ViaService 조건으로 Kinesis 경유 호출로만 범위를 좁힌다.
-  statement {
-    sid    = "EncryptStreamRecords"
-    effect = "Allow"
-    actions = [
-      "kms:GenerateDataKey",
-    ]
-    resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "kms:ViaService"
-      values   = ["kinesis.${var.region}.amazonaws.com"]
-    }
   }
 }
 
@@ -218,8 +186,6 @@ resource "aws_ecs_service" "api" {
 
   # 태스크가 등록되고 헬스체크를 통과할 시간을 준다.
   health_check_grace_period_seconds = 60
-
-  propagate_tags = "SERVICE"
 
   tags = {
     Name = "${var.name_prefix}-api-svc"

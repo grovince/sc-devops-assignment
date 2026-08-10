@@ -89,12 +89,11 @@ module "ecs" {
   region             = var.region
   private_subnet_ids = module.network.private_subnet_ids
   ecs_tasks_sg_id    = module.security.ecs_tasks_sg_id
-
   target_group_arn = module.alb.target_group_arn
 
   # ALBRequestCountPerTarget 지표는 두 ARN suffix를 이어붙인
   # app/<alb>/<id>/targetgroup/<tg>/<id> 형식을 요구한다.
-  alb_target_group_label = "${module.alb.alb_arn_suffix}/${module.alb.target_group_arn_suffix}"
+  alb_target_group_label = module.alb.target_group_label
 
   container_image    = var.container_image
   container_port     = var.container_port

@@ -1,3 +1,5 @@
 .venv
 __pycache__
 consumer
+/terraform/.terraform
+/terraform/.terraform.lock.hcl
