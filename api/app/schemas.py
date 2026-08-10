@@ -26,7 +26,7 @@ class LogEvent(BaseModel):
     # -> 파일 싱크는 at-least-once라 컨슈머 재시작 시 중복이 남을 수 있는데,
     #    분석 계층에서 event_id 기준 dedup으로 정확히 한 번을 복원할 수 있다.
     # 클라이언트가 직접 보내면 그 값을 쓴다(재시도까지 포함한 end-to-end 멱등).
-    # 없으면 API가 생성한다(컨슈머->DB 구간의 멱등만 보장).
+    # 없으면 API가 생성한다(컨슈머 -> 싱크 구간의 멱등만 보장)
     event_id: str = Field(default_factory=lambda: str(uuid4()), max_length=64)
 
     # 파티션 키. 유저 단위 이벤트 순서 보장에 사용
