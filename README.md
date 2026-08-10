@@ -191,5 +191,5 @@ docker compose logs api --tail 20
 ---
 
 # AWS 구성
-<img width="1212" height="1452" alt="sc 사전과제 aws drawio" src="https://github.com/user-attachments/assets/18eb7d67-c003-4379-b244-4f1ccdb31c08" />
+<img width="1212" height="1522" alt="슈퍼센트 사전과제 aws drawio (4)" src="https://github.com/user-attachments/assets/1413d949-b5c9-42f0-8e3a-73e996583871" />
 
