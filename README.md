@@ -375,7 +375,8 @@ Consumer 중단 중에도 API는 `200`을 반환했습니다.
 
 ### 8.2 아키텍처 구성도
 
-![AWS 아키텍처](./aws-architecture.png)
+<img width="1212" height="1522" alt="슈퍼센트 사전과제 aws drawio (5)" src="https://github.com/user-attachments/assets/52367081-e4f1-4e7a-8186-37b4a3d77871" />
+
 
 ### 8.3 네트워크 구성
 
