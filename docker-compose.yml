@@ -1,23 +1,69 @@
 # =============================================================================
-# 로그 수집 파이프라인 로컬 검증 환경
+# 로그 수집 파이프라인 로컬 검증 환경 (Kafka 3브로커 KRaft 쿼럼)
 #
-#     curl -> nginx(:8000) -> api(FastAPI, N replicas) -> Kafka(KRaft) -> consumer -> 파일 볼륨
+#     curl -> nginx(:8000) -> api(FastAPI, N replicas) -> Kafka(3 brokers) -> consumer -> 파일 볼륨
 #
 # 기동:      docker compose up -d --build
 # 확장 시연: docker compose up -d --scale api=3
 #
-# 검증: Kafka 토픽에서 로그를 직접 꺼내 도달을 확인한다.
-#   docker exec log-kafka /opt/kafka/bin/kafka-console-consumer.sh \
-#     --bootstrap-server localhost:9092 --topic game-logs --from-beginning
-#
-# 싱크로 파일(JSONL)을 택한 이유: 로그는 append-only 시계열 데이터라
-# 문서/관계형 DB의 인덱스·갱신 기능이 필요하지 않다. 프로덕션에서는
-# 이 자리가 그대로 S3가 된다 (Firehose -> S3 -> Athena).
-#
-# 이 compose는 '기능 검증용'이다. Kafka RF=1, min.insync.replicas=1이며,
-# 프로덕션(MSK)에서는 RF=3 + min.insync.replicas=2 + acks=all 조합이어야
-# '유실 없이'가 브로커 장애까지 커버한다. (README 참고)
+# 브로커 3대 + RF=3 + min.insync.replicas=2 + acks=all 조합이므로,
+# 브로커 1대가 죽어도 수집이 계속되고 2대가 죽으면 API가 503을 반환한다.
+# (동일 호스트 위의 복제라 물리적 내구성이 아니라 '유실 방지 계약'을 검증하는 구성이다)
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# 3개 브로커가 공유하는 설정. 노드마다 다른 값(NODE_ID, ADVERTISED_LISTENERS)만
+# 각 서비스에서 덮어쓴다.
+# -----------------------------------------------------------------------------
+x-kafka-common: &kafka-common
+  image: apache/kafka:3.9.0
+  healthcheck:
+    # 브로커가 API 요청에 실제로 응답하는지 확인 (프로세스 생존 여부가 아니라)
+    test:
+      [
+        "CMD-SHELL",
+        "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1",
+      ]
+    interval: 5s
+    timeout: 10s
+    retries: 12
+    # 단일 노드보다 쿼럼 형성에 시간이 걸리므로 유예 기간을 늘린다
+    start_period: 30s
+  restart: unless-stopped
+
+x-kafka-env: &kafka-env
+  # 세 노드가 '같은 클러스터'로 묶이려면 CLUSTER_ID가 동일해야 한다.
+  # 이미지 기본값에 의존하면 버전에 따라 노드별로 다른 ID가 생성될 수 있으므로
+  # 명시적으로 고정한다. (kafka-storage.sh random-uuid로 생성한 값)
+  CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+
+  KAFKA_PROCESS_ROLES: broker,controller
+
+  # 메타데이터 쿼럼 구성원 전체 목록. 세 노드 모두 동일한 값을 가져야 한다.
+  # (노드ID@주소:컨트롤러포트)
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+  # --- 복제 설정 ---
+  # 브로커가 3대이므로 내부 토픽(__consumer_offsets 등)도 기본값 RF=3을 그대로 쓴다.
+  # 단일 노드에서 1로 내려야 했던 제약이 사라진다.
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+  # 토픽 기본 복제 계수와 최소 ISR.
+  # min.insync.replicas=2 + acks=all -> 리더 외 팔로워 1대 이상이 복제를 확인해야
+  # 프로듀서가 성공을 받는다. 브로커 1대 장애는 견디고, 2대 장애 시 쓰기가 거부된다.
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  # 토픽은 kafka-init이 명시적으로 생성한다 (파티션 수 통제)
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
 
 services:
   # ---------------------------------------------------------------------------
@@ -32,7 +78,7 @@ services:
     ports:
       - "8000:80"
     volumes:
-      - ./api/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro #읽기 전용 설정
+      - ./api/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro # 읽기 전용 설정
     depends_on:
       api:
         condition: service_healthy
@@ -46,10 +92,16 @@ services:
     build: ./api
     environment:
       APP_ENV: local
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 부트스트랩 주소를 3개 모두 준다. 한 대가 죽어도 나머지로 메타데이터를
+      # 조회할 수 있어야 기동과 재연결이 성립한다.
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
       KAFKA_TOPIC: game-logs
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
@@ -62,72 +114,74 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)", 
-        ]
-      interval: 5s # 헬스체크 주기 
-      timeout: 5s # 응답 대기 시간 (헬스 체크 실행 후 5초 이내에 응답이 오지 않으면 검사 실패 -> 카운트 O)
-      retries: 5 # 최대 재시도 횟수
-      start_period: 10s # 초기 부팅 유예 기간(컨테이너가 켜지고 나서 처음 10초동안은 헬스체크가 실패해도 카운트 X)
-    restart: unless-stopped # 재시작 정책
-
-  # ---------------------------------------------------------------------------
-  # kafka: KRaft 단일 노드 (ZooKeeper 없음)
-  # ---------------------------------------------------------------------------
-  kafka:
-    image: apache/kafka:3.9.0
-    container_name: log-kafka
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller 
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093 #메타데이터를 관리할 Controller 노드들의 목록이다.(노드ID@주소:포트)
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      # --- 단일 노드 필수 설정 ---
-      # 내부 토픽(__consumer_offsets 등)의 기본 RF가 3이라,
-      # 아래 두 값을 1로 내리지 않으면 단일 노드에서 컨슈머 그룹이 뜨지 않는다.
-      # (검증용 kafka-console-consumer도 컨슈머 그룹을 사용한다)
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # 토픽은 kafka-init이 명시적으로 생성한다 (파티션 수 통제)
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      # 데이터 디렉토리를 named volume에 고정
-      # -> '컨테이너 재시작 시에도 유실되지 않도록' 요구 충족
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-    volumes:
-      - kafka-data:/var/lib/kafka/data
-    healthcheck:
-      # 브로커가 API 요청에 실제로 응답하는지 확인 (프로세스 생존 여부가 아니라)
-      test:
-        [
-          "CMD-SHELL",
-          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)",
         ]
       interval: 5s
-      timeout: 10s
-      retries: 10
-      start_period: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # kafka-1 / kafka-2 / kafka-3: KRaft 쿼럼 (ZooKeeper 없음)
+  # 각 노드가 broker + controller 역할을 겸한다.
+  # 컨트롤러 3대는 1대 장애까지 쿼럼(과반 2)을 유지한다.
+  # ---------------------------------------------------------------------------
+  kafka-1:
+    <<: *kafka-common
+    container_name: log-kafka-1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      # 클라이언트가 접속할 주소. 노드마다 자기 서비스명을 알린다.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+
+  kafka-2:
+    <<: *kafka-common
+    container_name: log-kafka-2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *kafka-common
+    container_name: log-kafka-3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
 
   # ---------------------------------------------------------------------------
   # kafka-init: 토픽을 '명시적으로' 생성하고 종료하는 1회성 컨테이너.
   # auto-create에 맡기면 파티션 1개짜리 토픽이 생긴다.
+  #
   # 파티션 3개 = user_id 키 해싱으로 유저별 순서를 보장하면서,
-  # 추후 컨슈머를 3개까지 병렬로 붙일 수 있는 구조를 미리 갖춘다.
+  #              추후 컨슈머를 3개까지 병렬로 붙일 수 있는 구조를 미리 갖춘다.
+  # RF 3      = 브로커 1대 장애까지 데이터가 남는다.
+  # min.insync.replicas=2 = acks=all과 짝을 이뤄 '몇 대가 확인해야 성공인가'를 정한다.
+  #   (브로커 기본값으로도 걸리지만, 이 토픽의 계약이므로 토픽 레벨에 명시한다)
   # ---------------------------------------------------------------------------
   kafka-init:
     image: apache/kafka:3.9.0
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
     entrypoint:
       [
         "/opt/kafka/bin/kafka-topics.sh",
         "--bootstrap-server",
-        "kafka:9092",
+        "kafka-1:9092",
         "--create",
         "--if-not-exists",
         "--topic",
@@ -135,10 +189,11 @@ services:
         "--partitions",
         "3",
         "--replication-factor",
-        "1",
+        "3",
+        "--config",
+        "min.insync.replicas=2",
       ]
     restart: "no"
-
 
   # ---------------------------------------------------------------------------
   # consumer: Kafka -> 파일 싱크 (프로덕션의 Firehose -> S3에 대응)
@@ -147,12 +202,16 @@ services:
     build: ./consumer
     container_name: log-consumer
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
       KAFKA_TOPIC: game-logs
     volumes:
       - log-data:/data/logs
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
@@ -160,6 +219,11 @@ services:
 
 # 컨테이너를 지워도(docker compose down) 데이터는 남는다.
 # 데이터까지 초기화하려면: docker compose down -v
+#
+# 브로커별로 볼륨을 분리해야 한다. 하나를 공유하면 세 노드가 같은 로그 디렉토리에
+# 동시에 쓰면서 메타데이터가 깨진다.
 volumes:
-  kafka-data:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
   log-data:
