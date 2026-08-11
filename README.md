@@ -427,8 +427,6 @@ S3에는 암호화와 Public Access Block을 적용하고, Lifecycle Rule을 통
 
 ### 8.6 Terraform 구성
 
-Terraform은 변경 영역을 기준으로 다음과 같이 모듈을 분리했습니다.
-
 ```
 network → security → pipeline → alb → ecs
 ```
